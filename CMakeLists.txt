@@ -72,6 +72,19 @@ add_executable(thm_hardcore_runner tests/hardcore_matrix_runner.cpp)
 target_link_libraries(thm_hardcore_runner PRIVATE thm_core pthread)
 add_test(NAME thm_hardcore_matrix_tests COMMAND thm_hardcore_runner)
 
+# ── Sustained Stress Test Suite ──────────────────────────────────────────────
+add_executable(thm_stress_test tests/stress_test.cpp)
+target_link_libraries(thm_stress_test PRIVATE thm_core pthread)
+
+add_test(NAME thm_stress_smoke
+        COMMAND thm_stress_test
+                --duration 60
+                --tick-ms 300
+                --csv ${CMAKE_CURRENT_BINARY_DIR}/stress_smoke.csv
+                --force-pressure HIGH
+                --aging-phase
+                --assert 3000)
+
 # ── Install targets ──────────────────────────────────────────────────────────
 install(TARGETS titan-hwm-v3 RUNTIME DESTINATION bin)
 install(FILES archtitan.slice
