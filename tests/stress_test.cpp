@@ -550,6 +550,7 @@ int main(int argc, char* argv[]) {
                 int idx = rng() % active_workloads.size();
                 for (pid_t p : active_workloads[idx].pids) {
                     reap_pid(p);
+                    detector.remove_baseline(p);
                     total_killed++;
                 }
                 active_workloads.erase(active_workloads.begin() + idx);
@@ -662,6 +663,7 @@ int main(int argc, char* argv[]) {
                                 ::kill(p, SIGKILL);
                                 int st;
                                 ::waitpid(p, &st, 0);
+                                detector.remove_baseline(p);
                                 total_killed++;
                             }
                         }
@@ -821,6 +823,7 @@ int main(int argc, char* argv[]) {
     for (auto& wl : active_workloads) {
         for (pid_t p : wl.pids) {
             reap_pid(p);
+            detector.remove_baseline(p);
         }
     }
     active_workloads.clear();
