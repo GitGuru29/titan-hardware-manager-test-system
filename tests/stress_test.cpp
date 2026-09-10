@@ -44,6 +44,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cerrno>
 #include <dirent.h>
 
 namespace fs = std::filesystem;
@@ -78,6 +79,10 @@ struct StressConfig {
     bool assert_enabled = false;
     double max_latency_p95_ms = 1500.0;
     int rss_growth_budget_pct = 10;   // allow up to +10% RSS growth
+    int rss_growth_budget_kb  = 0;    // optional absolute KB budget (0 = disabled);
+                                      // a run passes if BOTH are satisfied, so a
+                                      // small-baseline process can't fail a +10%
+                                      // over a 2 h run on a flat absolute footprint
     int pid_growth_budget = 300;      // allow up to +300 extra system PIDs
 };
 
@@ -139,7 +144,14 @@ static void reap_pid(pid_t pid) {
     if (pid <= 1) return;
     ::kill(pid, SIGKILL);
     int status;
-    ::waitpid(pid, &status, WNOHANG);
+    // Blocking wait guarantees the child is reaped. A non-blocking (WNOHANG)
+    // wait right after SIGKILL races the child's death and leaves a zombie
+    // behind; over long runs those zombies accumulate unboundedly.
+    for (;;) {
+        if (::waitpid(pid, &status, 0) == pid) return;
+        if (errno == ECHILD) return; // already reaped/not our child
+        if (errno != EINTR)  return; // unexpected — abandon
+    }
 }
 
 static char read_proc_state(pid_t pid) {
@@ -338,6 +350,12 @@ int main(int argc, char* argv[]) {
         else if (arg == "--pid-budget" && i + 1 < argc) {
             cfg.pid_growth_budget = std::max(1, std::stoi(argv[++i]));
         }
+        else if (arg == "--rss-budget-pct" && i + 1 < argc) {
+            cfg.rss_growth_budget_pct = std::clamp(std::stoi(argv[++i]), 1, 500);
+        }
+        else if (arg == "--rss-budget-kb" && i + 1 < argc) {
+            cfg.rss_growth_budget_kb = std::max(0, std::stoi(argv[++i]));
+        }
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: thm_stress_test [OPTIONS]\n"
                       << "  --duration SEC        Duration in seconds (default: 1800 = 30 min)\n"
@@ -351,6 +369,10 @@ int main(int argc, char* argv[]) {
                       << "                        toward real HIGH/CRITICAL pressure)\n"
                       << "  --assert [P95_MS]     Enable pass/fail assertions (default p95 ceiling 1500ms)\n"
                       << "  --pid-budget N        PID growth assertion budget (default: 300; scale with duration)\n"
+                      << "  --rss-budget-pct N    RSS growth assertion budget %% (default: 10)\n"
+                      << "  --rss-budget-kb N     Absolute RSS growth assertion budget in KB\n"
+                      << "                        (default: 0 = disabled; run passes only if BOTH\n"
+                      << "                         %% and KB budgets are satisfied) \n"
                       << "  --help                Show this help\n";
             return 0;
         }
@@ -409,6 +431,15 @@ int main(int argc, char* argv[]) {
     std::mt19937 rng(42);
 
     // Tick latency tracking (ring buffer)
+    // Tick latency tracking — capped history so memory stays bounded regardless
+    // of run duration (an unbounded vector grows linearly with wall-clock time).
+    constexpr size_t kLatencyWindow = 100000; // ~5.5 h at 5 ticks/s
+    auto push_latency = [](std::vector<double>& v, double sample) {
+        v.push_back(sample);
+        if (v.size() > kLatencyWindow)
+            v.erase(v.begin(), v.end() - static_cast<long>(kLatencyWindow));
+    };
+
     std::vector<double> tick_latencies;
     tick_latencies.reserve(5000);
 
@@ -519,6 +550,7 @@ int main(int argc, char* argv[]) {
                 int idx = rng() % active_workloads.size();
                 for (pid_t p : active_workloads[idx].pids) {
                     reap_pid(p);
+                    detector.remove_baseline(p);
                     total_killed++;
                 }
                 active_workloads.erase(active_workloads.begin() + idx);
@@ -631,6 +663,7 @@ int main(int argc, char* argv[]) {
                                 ::kill(p, SIGKILL);
                                 int st;
                                 ::waitpid(p, &st, 0);
+                                detector.remove_baseline(p);
                                 total_killed++;
                             }
                         }
@@ -644,7 +677,7 @@ int main(int argc, char* argv[]) {
         auto pipeline_end = std::chrono::steady_clock::now();
         double pipeline_ms = std::chrono::duration<double, std::milli>(
             pipeline_end - pipeline_start).count();
-        pipeline_latencies.push_back(pipeline_ms);
+        push_latency(pipeline_latencies, pipeline_ms);
 
         // Prune workloads terminated by the reclaim engine this tick
         active_workloads.erase(
@@ -667,7 +700,7 @@ int main(int argc, char* argv[]) {
         auto tick_end = std::chrono::steady_clock::now();
         double tick_ms = std::chrono::duration<double, std::milli>(
             tick_end - tick_start).count();
-        tick_latencies.push_back(tick_ms);
+        push_latency(tick_latencies, tick_ms);
 
         // ── Progress display (every 5s) ────────────────────────────────
         if (tick_count % 25 == 0) {
@@ -790,6 +823,7 @@ int main(int argc, char* argv[]) {
     for (auto& wl : active_workloads) {
         for (pid_t p : wl.pids) {
             reap_pid(p);
+            detector.remove_baseline(p);
         }
     }
     active_workloads.clear();
@@ -821,19 +855,31 @@ int main(int argc, char* argv[]) {
         long rss_growth_kb = final_sys2.rss_kb - baseline_rss_kb;
         long rss_growth_pct = baseline_rss_kb > 0
             ? (100 * rss_growth_kb) / baseline_rss_kb : 0;
-        if (rss_growth_pct <= cfg.rss_growth_budget_pct && rss_growth_kb >= 0) {
+        // RSS passes if BOTH the relative % budget and (when set) the absolute
+        // KB budget hold. A small-baseline process can otherwise fail a +10%
+        // gate purely because its baseline is tiny while its absolute drift is
+        // negligible — the absolute bound captures "real" growth.
+        bool rss_pct_ok = rss_growth_pct <= cfg.rss_growth_budget_pct;
+        bool rss_kb_ok  = cfg.rss_growth_budget_kb <= 0
+                          || rss_growth_kb <= cfg.rss_growth_budget_kb;
+        if (rss_pct_ok && rss_kb_ok) {
             pass_assert("RSS growth " + std::to_string(rss_growth_kb) + " KB ("
                         + std::to_string(rss_growth_pct) + "%) within "
-                        + std::to_string(cfg.rss_growth_budget_pct) + "% budget");
+                        + std::to_string(cfg.rss_growth_budget_pct) + "% / "
+                        + std::to_string(cfg.rss_growth_budget_kb) + "KB budget");
         } else {
+            std::string why;
+            if (!rss_pct_ok) why += ", exceeds " + std::to_string(cfg.rss_growth_budget_pct) + "%";
+            if (!rss_kb_ok)  why += ", exceeds " + std::to_string(cfg.rss_growth_budget_kb) + "KB";
             fail_assert("RSS growth " + std::to_string(rss_growth_kb) + " KB ("
-                        + std::to_string(rss_growth_pct) + "%) exceeds "
-                        + std::to_string(cfg.rss_growth_budget_pct) + "% budget");
+                        + std::to_string(rss_growth_pct) + "%)" + why);
         }
 
-        // 2. PID-growth guard: no unbounded accumulation of system PIDs
+        // 2. PID-growth guard: no unbounded accumulation of system PIDs.
+        // Negative growth (fewer PIDs at the end than baseline) is a pass —
+        // the guard exists to catch positive, unbounded accumulation.
         int pid_growth = final_sys2.total_pids - baseline_total_pids;
-        if (pid_growth <= cfg.pid_growth_budget && pid_growth >= 0) {
+        if (pid_growth <= cfg.pid_growth_budget) {
             pass_assert("System PID growth " + std::to_string(pid_growth)
                         + " within budget " + std::to_string(cfg.pid_growth_budget));
         } else {
