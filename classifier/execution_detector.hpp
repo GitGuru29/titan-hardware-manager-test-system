@@ -119,6 +119,12 @@ public:
     void update_baseline(pid_t pid, long ticks);
     void remove_baseline(pid_t pid);
 
+    // ── Instrumentation ───────────────────────────────────────────────────────
+    // Number of live per-PID baselines. Must stay bounded by the concurrent
+    // process count: an entry surviving its process means remove_baseline was
+    // not called on every path that dropped the PID.
+    std::size_t baseline_count() const { return prev_ticks_.size(); }
+
 private:
     ExecutionConfig cfg_;
 

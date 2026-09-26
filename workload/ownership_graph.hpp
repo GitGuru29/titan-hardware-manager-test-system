@@ -112,6 +112,13 @@ public:
     // Infer workload type from filesystem markers in CWD
     static WorkloadType infer_from_cwd(const std::string& cwd);
 
+    // ── Instrumentation ───────────────────────────────────────────────────────
+    // Container sizes, for leak attribution. These must stay bounded: the graph
+    // is keyed by PID, so an unpruned entry means the PID was never removed.
+    std::size_t tracked_pid_count() const;
+    std::size_t tracked_workload_count() const;
+    std::size_t total_pid_edges() const;
+
 private:
     mutable std::mutex mtx_;
 

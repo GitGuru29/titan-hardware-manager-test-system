@@ -40,6 +40,16 @@ public:
     // Called once at startup after systemd units are confirmed running.
     void bootstrap_from_systemd();
 
+    // ─── Instrumentation ─────────────────────────────────────────────────────
+
+    // Number of explicitly registered PIDs. This map is pid → reason string and
+    // is the heaviest per-PID structure in the process, so an entry that
+    // outlives its PID is the first thing to check when RSS tracks spawn count.
+    std::size_t explicit_count() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return explicit_pids_.size();
+    }
+
 private:
     mutable std::mutex          mtx_;
 

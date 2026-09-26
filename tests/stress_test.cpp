@@ -28,6 +28,7 @@
 
 #include <iostream>
 #include <iomanip>
+#include <malloc.h>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -228,6 +229,58 @@ struct DecisionStats {
     int total = 0;
 };
 
+// ── Container census ─────────────────────────────────────────────────────────
+// Per-tick sizes of every long-lived container in the process.
+//
+// Why this exists: across four stress campaigns RSS grew linearly at a near
+// constant ~0.15 KB per workload spawned, in every run, with no plateau. The
+// existing columns could not attribute it, because rss_kb correlates equally
+// well with elapsed time, decision count and PID count — all of which grow
+// linearly together. These columns break that tie: each one is a count that
+// must be BOUNDED, so whichever climbs with spawn count names the structure.
+//
+// A healthy run shows these flat. rss_per_spawn_kb is the derived figure that
+// made the pattern visible; it is recomputed, not measured.
+struct Census {
+    long reg_ids     = 0;  // WorkloadManager registry entries
+    long det_base    = 0;  // ExecutionDetector per-PID CPU baselines
+    long own_pids    = 0;  // OwnershipGraph pid -> workload entries
+    long own_wls     = 0;  // OwnershipGraph workload buckets
+    long own_edges   = 0;  // OwnershipGraph total pid edges
+    long prot_pids   = 0;  // ProtectedRegistry explicit registrations
+    long warn_cwds   = 0;  // FusionClassifier S3 warning dedup set
+    long pend_notify = 0;  // ReclaimEngine undelivered notification children
+    long pool        = 0;  // harness active workload pool
+    long lat_win     = 0;  // harness tick-latency ring buffer occupancy
+    long pipe_win    = 0;  // harness pipeline-latency ring buffer occupancy
+    double rss_per_spawn_kb = 0.0;
+    // Allocator census. If in-use bytes track RSS, the growth is logical
+    // retention and a container above is leaking. If in-use bytes stay flat
+    // while RSS climbs, it is arena growth or fragmentation, and no amount of
+    // container auditing will find it.
+    long mall_inuse_kb  = 0;
+    long mall_arena_kb  = 0;
+    long mall_hblkhd_kb = 0;
+};
+
+// glibc malloc census. mallinfo2() is glibc >= 2.33 and is the only variant
+// that is correct in a 64-bit process; the legacy mallinfo() truncates several
+// fields to int and would itself under-report on a multi-GB heap.
+static inline void read_malloc_census(Census& c) {
+#if defined(__GLIBC__)
+#if defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 33)
+    struct mallinfo2 mi = mallinfo2();
+    c.mall_inuse_kb  = (long)(mi.uordblks / 1024);
+    c.mall_arena_kb  = (long)((mi.arena + mi.hblkhd) / 1024);
+    c.mall_hblkhd_kb = (long)(mi.hblkhd / 1024);
+#endif
+#endif
+#else
+    (void)c;
+#endif
+}
+
 // ── CSV Logger ──────────────────────────────────────────────────────────────
 class CSVLogger {
 public:
@@ -238,16 +291,21 @@ public:
                  << "processes_spawned_total,processes_killed_total,decisions_total,"
                  << "keep_full,keep_bg,throttle,freeze,reclaim,"
                  << "rss_kb,total_pids,mem_used_pct,psi_some,pressure_level,"
-                 << "governor_hint,reclaim_aborts\n";
+                 << "governor_hint,reclaim_aborts,"
+                 << "census_reg_ids,census_det_base,census_own_pids,census_own_wls,"
+                 << "census_own_edges,census_prot_pids,census_warn_cwds,"
+                 << "census_pend_notify,census_pool,census_lat_win,census_pipe_win,"
+                 << "lat_bytes_kb,rss_per_spawn_kb,"
+                 << "mall_inuse_kb,mall_arena_kb,mall_hblkhd_kb\n";
             ofs_.flush();
         }
     }
 
-void log(int elapsed_sec, int tick_count, double avg_ms, double p99_ms,
+    void log(int elapsed_sec, int tick_count, double avg_ms, double p99_ms,
              double pipe_avg_ms, double pipe_p99_ms,
              int active_wl, int spawned, int killed, const DecisionStats& ds,
              const SystemMetrics& sys, thm::PressureLevel pressure,
-             thm::GovernorHint gov, int reclaim_aborts) {
+             thm::GovernorHint gov, int reclaim_aborts, const Census& c) {
         if (!ofs_.is_open()) return;
         ofs_ << elapsed_sec << ","
              << tick_count << ","
@@ -272,9 +330,26 @@ void log(int elapsed_sec, int tick_count, double avg_ms, double p99_ms,
              << (gov == thm::GovernorHint::PERFORMANCE ? "PERFORMANCE" :
                  gov == thm::GovernorHint::POWERSAVE ? "POWERSAVE" : "SCHEDUL")
              << "," << reclaim_aborts
+             << "," << c.reg_ids
+             << "," << c.det_base
+             << "," << c.own_pids
+             << "," << c.own_wls
+             << "," << c.own_edges
+             << "," << c.prot_pids
+             << "," << c.warn_cwds
+             << "," << c.pend_notify
+             << "," << c.pool
+             << "," << c.lat_win
+             << "," << c.pipe_win
+             << "," << (long)((c.lat_win + c.pipe_win) * sizeof(double) / 1024)
+             << "," << std::setprecision(4) << c.rss_per_spawn_kb
+             << "," << c.mall_inuse_kb
+             << "," << c.mall_arena_kb
+             << "," << c.mall_hblkhd_kb
              << "\n";
         ofs_.flush();
     }
+
 
     void close() { ofs_.close(); }
 
@@ -735,10 +810,27 @@ int main(int argc, char* argv[]) {
             double pipe_p99 = sorted_pipe.empty() ? 0.0 :
                 sorted_pipe[(int)(sorted_pipe.size() * 0.99)];
 
+            Census c;
+            c.reg_ids     = (long)workload_mgr.all_ids().size();
+            c.det_base    = (long)detector.baseline_count();
+            c.own_pids    = (long)ownership.tracked_pid_count();
+            c.own_wls     = (long)ownership.tracked_workload_count();
+            c.own_edges   = (long)ownership.total_pid_edges();
+            c.prot_pids   = (long)registry.explicit_count();
+            c.warn_cwds   = (long)thm::FusionClassifier::warned_cwd_count();
+            c.pend_notify = (long)reclaimer.pending_notify_count();
+            c.pool        = (long)active_workloads.size();
+            c.lat_win     = (long)tick_latencies.size();
+            c.pipe_win    = (long)pipeline_latencies.size();
+            read_malloc_census(c);
+            if (total_spawned > 0)
+                c.rss_per_spawn_kb =
+                    (double)(sys.rss_kb - baseline_rss_kb) / (double)total_spawned;
+
             csv.log(elapsed, tick_count, avg, p99, pipe_avg, pipe_p99,
                    (int)active_workloads.size(),
                    total_spawned, total_killed, lifetime_stats, sys, pressure,
-                   gov, total_reclaim_aborts);
+                   gov, total_reclaim_aborts, c);
             last_csv_log = tick_end;
         }
 
