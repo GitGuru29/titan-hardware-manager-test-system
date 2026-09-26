@@ -106,6 +106,24 @@ void OwnershipGraph::remove(pid_t pid) {
     pid_to_wl_.erase(it);
 }
 
+// ── Instrumentation ──────────────────────────────────────────────────────────
+std::size_t OwnershipGraph::tracked_pid_count() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return pid_to_wl_.size();
+}
+
+std::size_t OwnershipGraph::tracked_workload_count() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return wl_to_pids_.size();
+}
+
+std::size_t OwnershipGraph::total_pid_edges() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    std::size_t n = 0;
+    for (const auto& [wl, pids] : wl_to_pids_) n += pids.size();
+    return n;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Cold-start bootstrap
 //
