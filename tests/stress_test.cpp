@@ -73,6 +73,11 @@ struct StressConfig {
     // Memory-hog scaling (MB per hog process). Raise to generate real pressure.
     int memory_hog_mb = 4;
 
+    // ISSUE-07: hard floor on MemAvailable (MB). 0 = disabled. When set, a
+    // dedicated sink ramps real anonymous memory down to this floor and holds
+    // it, which is what forces genuine direct reclaim and a non-zero PSI.
+    int memory_floor_mb = 0;
+
     // Aging/decay phase: pre-age idle workloads to exercise IDLE→AGING→RECLAIMABLE
     bool aging_phase = false;
 
@@ -135,6 +140,58 @@ static pid_t spawn_memory_hog() {
             buffer[x % buffer.size()] = 'B' + (x % 24);
             ++x;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        _exit(0);
+    }
+    return pid;
+}
+
+// ── ISSUE-07 fix: genuine memory pressure ────────────────────────────────────
+// Why this exists: the per-workload memory hog tops out at
+// max_workloads(200) * 1-in-4 spawn odds * 4 MB = ~200 MB, which is 2.6% of a
+// 15 GB box. It never reached a reclaim watermark, so the kernel never stalled:
+// /proc/pressure/memory read `some total=18` (18 MICROSECONDS) across the whole
+// machine's uptime. That is ISSUE-07 — "PSI never non-zero; pressure was
+// synthetic only". Note the PSI machinery itself is fine: /proc/pressure/io
+// reads avg10 ~1.7 with ~285s accumulated. Only memory pressure was absent.
+//
+// --memory-floor-mb <N> starts one long-lived sink that allocates real,
+// touched anonymous memory in bounded steps until MemAvailable reaches N, then
+// holds it there — releasing if something else needs the headroom. The floor is
+// a hard bound on how little free memory the run leaves for the rest of the
+// system, so the run cannot OOM by construction; the only risk is the number
+// the operator passes in.
+static pid_t spawn_pressure_sink(int floor_mb) {
+    if (floor_mb <= 0) return -1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        constexpr size_t kChunk = 32ull * 1024 * 1024;
+        constexpr long   kFloorDelta = 1024; // settle within 1 MB of the floor
+        std::vector<std::vector<char>> chunks;
+        size_t touch = 0;
+        const long floor_kb = static_cast<long>(floor_mb) * 1024;
+        for (;;) {
+            thm::MemInfo mem = thm::read_meminfo();
+            if (mem.available_kb <= 0) break;
+            try {
+                if (mem.available_kb > floor_kb + kFloorDelta) {
+                    long over_kb = mem.available_kb - floor_kb;
+                    size_t want = std::min(kChunk, static_cast<size_t>(over_kb) * 1024);
+                    if (want >= 1024 * 1024) chunks.emplace_back(want, 'P');
+                } else if (mem.available_kb < floor_kb && !chunks.empty()) {
+                    // Someone else took headroom past our floor — hand it back
+                    // rather than squeeze the desktop below the promised floor.
+                    chunks.pop_back();
+                }
+            } catch (...) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            // Keep every held page resident. An untouched allocation is
+            // reclaimed immediately and would never generate PSI.
+            for (auto& c : chunks)
+                if (!c.empty()) { c[touch++ % c.size()] = 'S'; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
         _exit(0);
     }
@@ -415,6 +472,9 @@ int main(int argc, char* argv[]) {
             cfg.memory_hog_mb = std::max(1, std::stoi(argv[++i]));
             g_memory_hog_mb = cfg.memory_hog_mb;
         }
+        else if (arg == "--memory-floor-mb" && i + 1 < argc) {
+            cfg.memory_floor_mb = std::max(0, std::stoi(argv[++i]));
+        }
         else if (arg == "--aging-phase") cfg.aging_phase = true;
         else if (arg == "--assert") {
             cfg.assert_enabled = true;
@@ -442,6 +502,9 @@ int main(int argc, char* argv[]) {
                       << "  --aging-phase         Pre-age idle workloads to exercise IDLE->AGING->RECLAIMABLE\n"
                       << "  --memory-hog-mb MB    Per-worker memory allocation (default: 4; raise to push system\n"
                       << "                        toward real HIGH/CRITICAL pressure)\n"
+                      << "  --memory-floor-mb MB  ISSUE-07: ramp real memory down until MemAvailable reaches\n"
+                      << "                        this floor and hold it, so PSI actually registers.\n"
+                      << "                        0 = disabled (default). Hard bound — never goes lower.\n"
                       << "  --assert [P95_MS]     Enable pass/fail assertions (default p95 ceiling 1500ms)\n"
                       << "  --pid-budget N        PID growth assertion budget (default: 300; scale with duration)\n"
                       << "  --rss-budget-pct N    RSS growth assertion budget %% (default: 10)\n"
@@ -470,9 +533,18 @@ int main(int argc, char* argv[]) {
         std::cout << " force_pressure=" << thm::to_string(cfg.force_pressure);
     if (cfg.aging_phase)
         std::cout << " aging_phase=ON";
+    if (cfg.memory_floor_mb > 0)
+        std::cout << " memory_floor=" << cfg.memory_floor_mb << "MB";
     if (cfg.assert_enabled)
         std::cout << " assertions=ON";
     std::cout << "\n\n";
+
+    // ISSUE-07: start the genuine-pressure sink before the pipeline comes up so
+    // it has time to ramp to the floor rather than sampling a cold system.
+    pid_t pressure_sink = spawn_pressure_sink(cfg.memory_floor_mb);
+    if (pressure_sink > 0)
+        std::cout << "[ISSUE-07] Pressure sink " << pressure_sink
+                  << " ramping to MemAvailable <= " << cfg.memory_floor_mb << " MB\n\n";
 
     // ── Init THM components ──────────────────────────────────────────────
     thm::ProtectedRegistry registry;
@@ -919,6 +991,12 @@ int main(int argc, char* argv[]) {
         }
     }
     active_workloads.clear();
+
+    if (pressure_sink > 0) {
+        std::cout << "[ISSUE-07] Releasing pressure sink...\n";
+        reap_pid(pressure_sink);
+        pressure_sink = -1;
+    }
 
     std::cout << "[DONE] Stress test complete.\n\n";
 
