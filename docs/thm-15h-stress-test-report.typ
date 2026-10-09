@@ -55,15 +55,18 @@ Three results matter:
 - *PID handling is leak-free at the scale tested.* System-wide PID count added
   67 net over 15 hours, consistent with the 6-hour run and isolating the 10-hour
   stage-1 figure as the anomaly.
-- *The run measured the harness, not the shipped daemon.* The harness is
-  decision-only; it never calls `EnforcementPlane::apply()`. Kernel-level
-  enforcement remains unobserved end-to-end.
+- *The 15-hour run measured the harness, not the shipped daemon.* At the time it
+  ran the harness was decision-only and never called
+  `EnforcementPlane::apply()`, so this run covers no kernel enforcement. The
+  harness can now observe enforcement — an F1 probe was added afterward and
+  verified as root.
 
 This report also records the *seven new findings* surfaced while preparing,
-running, and interpreting the soak. Two are shipping defects in the systemd
-unit (a `--dry-run` directive that leaked into the wrong copy, and an invalid
-user-session target on a root system service); both are fixed. The rest are
-test-harness and measurement defects, with mitigations noted below.
+running, and interpreting the soak. Five are now resolved: two shipping defects
+in the systemd unit (a `--dry-run` directive that leaked into the wrong copy,
+and an invalid user-session target on a root system service) are fixed, and
+three harness defects (F1, F4, F6) were implemented, verified, and pushed to the
+tester tree after this report's first draft. F5 and F7 remain open.
 
 = Test configuration
 
@@ -197,17 +200,18 @@ F5.
 = New findings and fixes
 
 Seven findings were surfaced during this run. Two are shipping defects in the
-systemd unit, both now fixed; five are in the test harness or its measurements.
+systemd unit and were fixed immediately; three more (F1, F4, F6) were
+implemented and verified in the tester tree after the run. Two remain open.
 
 #table(
   columns: (1.0cm, 6.0cm, 2.6cm, 1.6cm),
   [*ID*], [*Finding*], [*Type*], [*State*],
-  [F1], [Harness never applies enforcement (decision-only)], [Test defect], [Open],
+  [F1], [Harness never applies enforcement (decision-only)], [Test defect], [*Fixed*],
   [F2], [`--dry-run` leaked into the product service unit], [Ship defect], [*Fixed*],
   [F3], [Root system service targeted a user-session target], [Ship defect], [*Fixed*],
-  [F4], [`setup_slices()` silently no-ops if the slice is inactive], [Observability], [Open],
+  [F4], [`setup_slices()` silently no-ops if the slice is inactive], [Observability], [*Fixed*],
   [F5], [`--aging-phase` suppresses PSI and hides stall pressure], [Test design], [Open],
-  [F6], [PID assertion baseline is one noisy startup sample], [Measurement], [Open],
+  [F6], [PID assertion baseline is one noisy startup sample], [Measurement], [*Fixed*],
   [F7], [`reap_pid` blocks in `waitpid` on a SIGKILLed child], [Latent risk], [Open],
 )
 
@@ -222,14 +226,15 @@ the test is physically incapable of producing it.
 *Impact.* High. It invalidates any claim that enforcement "works"; only the
 policy/classification layer has been exercised.
 
-*Solution.* Add an enforcement-capable test path. Either (a) an integration
-test that constructs `EnforcementPlane` and calls `apply()` against a
-sacrificial cgroup workload, asserting the observed `cgroup.freeze`,
-`cpu.weight`, and `memory.high` values; or (b) run `titan-hwm-daemon`
-non-dry-run as root under `Slice=archtitan.slice` and log one real
-freeze/throttle/reclaim. The plumbing was verified live (the cgroup
-`subtree_control` comes up correctly); what is missing is an observation of an
-action taking effect.
+*Solution.* *Fixed and verified.* The harness gained `--enforce-probe`, which
+forks a sacrificial child, calls `EnforcementPlane::apply()` with a `FREEZE`
+decision against it, and asserts the kernel actually acted: the process state
+must be `T` and the frozen slice's `cgroup.freeze` must read `1`, after which
+the child is thawed and reaped. Run as root under `Slice=archtitan.slice`, the
+probe passes — child state `S→T`, `cgroup.freeze=1`, `apply()=true`. This is the
+first end-to-end observation of kernel-level enforcement in the series. In a
+decision-only environment the probe SKIPs rather than fails, so it never blocks
+ordinary soak runs.
 
 == F2 — `--dry-run` leaked into the product service unit
 
@@ -266,9 +271,14 @@ happened.
 
 *Impact.* Medium. It turns a configuration mistake into a silently invalid test.
 
-*Solution.* Start the slice as a hard precondition of any enforcement run, and
-have `setup_slices()` fail loudly (non-zero return, banner logged) when it
-cannot create or join the slice. Document the prerequisite in the driver.
+*Solution.* *Fixed.* `setup_slices()` now verifies real write access with a
+`cgroup.freeze` write-probe instead of trusting that the sub-slice directories
+exist — under an undelegated slice the directories exist but every control
+write is `EACCES`, which is exactly how the ten-hour run's writes disappeared
+without a trace. The harness now prints a DECISION-ONLY banner and a slice
+status line when the slice is unavailable, and aborts with exit 2 under the new
+`--require-slice` flag. The daemon's "hierarchy setup failed" warning now fires
+correctly in this case too.
 
 == F5 — `--aging-phase` suppresses PSI
 
@@ -294,9 +304,11 @@ because `total_pids` counts the entire desktop.
 *Impact.* Low. The budget is wide enough that the verdict is unaffected, but
 the printed number is misleading and cannot be trended.
 
-*Solution.* Sample the baseline over a short window (median of the first N
-scans) and, better, count only the daemon's own cgroup via `cgroup.procs`
-rather than scanning all of `/proc`.
+*Solution.* *Fixed.* The guard now measures the harness's own process tree
+(`tree_pids`, walked over PPID links) instead of the whole machine's `/proc`
+total. The system-wide figure is still reported, but labeled informational.
+`tree_pids` is appended to the CSV, so existing columns and analyzers are
+unchanged.
 
 == F7 — `reap_pid` blocking wait (latent)
 
@@ -317,22 +329,25 @@ Three limits are material and should travel with any citation of these numbers:
 
 - *It measures the harness, not the daemon.* Every figure above describes
   `thm_stress_test`. `titan-hwm-daemon` has never been profiled under load.
-- *No enforcement action was ever observed.* The harness is decision-only (F1);
-  kernel-level freeze, throttle, and `memory.high` remain unverified.
+- *This run observed no enforcement action.* At the time it ran the harness was
+  decision-only (F1); the enforcement probe that now proves the kernel path was
+  added afterward, so the 15-hour numbers themselves still cover no enforcement.
+  Throttle and `memory.high` remain unexercised even by the probe, which only
+  verifies `FREEZE`.
 - *PSI and memory-usage figures are floor-specific.* The 2 GB floor makes them
   non-comparable to the pre-fix campaigns, and `--aging-phase` (F5) makes the
   PSI numbers non-diagnostic.
 
 = Recommended next actions
 
++ *Verify `THROTTLE` and `memory.high`, not just `FREEZE`.* The F1 probe proves
+  the freeze path; `cpu.weight` and `memory.high` still have no observed effect.
 + *Run the daemon as root, non-dry-run, under `Slice=archtitan.slice`, and log
-  one enforcement action.* This is the single highest-value test left; the
-  harness cannot provide it.
+  one enforcement action on a real workload.* The harness probe covers the path;
+  the shipped daemon itself is still untested under load.
 + *Profile the daemon's own RSS and latency under sustained load.* Every
   measurement to date is the harness.
-+ *Add a slice-active precondition and a loud failure to `setup_slices()`*
-  (F4).
-+ *Count PIDs from the daemon's cgroup, not all of `/proc`* (F6).
 + *Keep the product and shipping systemd units identical, and add a check that
   rejects a `--dry-run` unit* (F2/F3) — done by hand here, worth automating.
 + *Add a non-aging pressure stage that sustains PSI above zero* (F5).
++ *Bound `reap_pid`'s wait with a deadline* (F7).
