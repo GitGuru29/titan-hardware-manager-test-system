@@ -7,10 +7,15 @@
 //   - Simulates rapid workspace switching across 6 workspaces
 //   - Drives the complete classify → detect → tick → policy → enforce pipeline
 //   - Measures tick latency, decision throughput, process churn rate
-//   - Monitors system-wide metrics (RSS, PID count, pressure level)
+//   - Monitors system metrics (RSS, system PIDs, own process-tree PIDs,
+//     pressure level) — see the F6 note on tree_pids
+//   - Optionally probes real kernel enforcement (F1, --enforce-probe)
+//   - Refuses to masquerade as an enforcement run when the slice is absent
+//     (F4, --require-slice)
 //   - Logs CSV every 10 seconds for post-analysis
 //
 // Usage: ./thm_stress_test [--duration SEC] [--csv PATH] [--tick-ms MS]
+//                          [--require-slice] [--enforce-probe]
 // =============================================================================
 
 #include "../core/types.hpp"
@@ -46,7 +51,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdlib>
 #include <dirent.h>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -73,6 +80,11 @@ struct StressConfig {
     // Memory-hog scaling (MB per hog process). Raise to generate real pressure.
     int memory_hog_mb = 4;
 
+    // ISSUE-07: hard floor on MemAvailable (MB). 0 = disabled. When set, a
+    // dedicated sink ramps real anonymous memory down to this floor and holds
+    // it, which is what forces genuine direct reclaim and a non-zero PSI.
+    int memory_floor_mb = 0;
+
     // Aging/decay phase: pre-age idle workloads to exercise IDLE→AGING→RECLAIMABLE
     bool aging_phase = false;
 
@@ -85,6 +97,16 @@ struct StressConfig {
                                       // small-baseline process can't fail a +10%
                                       // over a 2 h run on a flat absolute footprint
     int pid_growth_budget = 300;      // allow up to +300 extra system PIDs
+
+    // F4: refuse to run when archtitan.slice is unavailable. Without the slice
+    // every cgroup write is a no-op, so the run measures decisions only. When
+    // false, an absent slice still logs a loud DECISION-ONLY banner.
+    bool require_slice = false;
+
+    // F1: actively prove the enforcement plane reaches the kernel by freezing
+    // and thawing a sacrificial child (cgroup.freeze + process state T).
+    // Requires the slice; otherwise the probe is SKIPped, not failed.
+    bool enforce_probe = false;
 };
 
 // ── Process Spawning Helpers ────────────────────────────────────────────────
@@ -141,6 +163,58 @@ static pid_t spawn_memory_hog() {
     return pid;
 }
 
+// ── ISSUE-07 fix: genuine memory pressure ────────────────────────────────────
+// Why this exists: the per-workload memory hog tops out at
+// max_workloads(200) * 1-in-4 spawn odds * 4 MB = ~200 MB, which is 2.6% of a
+// 15 GB box. It never reached a reclaim watermark, so the kernel never stalled:
+// /proc/pressure/memory read `some total=18` (18 MICROSECONDS) across the whole
+// machine's uptime. That is ISSUE-07 — "PSI never non-zero; pressure was
+// synthetic only". Note the PSI machinery itself is fine: /proc/pressure/io
+// reads avg10 ~1.7 with ~285s accumulated. Only memory pressure was absent.
+//
+// --memory-floor-mb <N> starts one long-lived sink that allocates real,
+// touched anonymous memory in bounded steps until MemAvailable reaches N, then
+// holds it there — releasing if something else needs the headroom. The floor is
+// a hard bound on how little free memory the run leaves for the rest of the
+// system, so the run cannot OOM by construction; the only risk is the number
+// the operator passes in.
+static pid_t spawn_pressure_sink(int floor_mb) {
+    if (floor_mb <= 0) return -1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        constexpr size_t kChunk = 32ull * 1024 * 1024;
+        constexpr long   kFloorDelta = 1024; // settle within 1 MB of the floor
+        std::vector<std::vector<char>> chunks;
+        size_t touch = 0;
+        const long floor_kb = static_cast<long>(floor_mb) * 1024;
+        for (;;) {
+            thm::MemInfo mem = thm::read_meminfo();
+            if (mem.available_kb <= 0) break;
+            try {
+                if (mem.available_kb > floor_kb + kFloorDelta) {
+                    long over_kb = mem.available_kb - floor_kb;
+                    size_t want = std::min(kChunk, static_cast<size_t>(over_kb) * 1024);
+                    if (want >= 1024 * 1024) chunks.emplace_back(want, 'P');
+                } else if (mem.available_kb < floor_kb && !chunks.empty()) {
+                    // Someone else took headroom past our floor — hand it back
+                    // rather than squeeze the desktop below the promised floor.
+                    chunks.pop_back();
+                }
+            } catch (...) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            // Keep every held page resident. An untouched allocation is
+            // reclaimed immediately and would never generate PSI.
+            for (auto& c : chunks)
+                if (!c.empty()) { c[touch++ % c.size()] = 'S'; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        _exit(0);
+    }
+    return pid;
+}
+
 static void reap_pid(pid_t pid) {
     if (pid <= 1) return;
     ::kill(pid, SIGKILL);
@@ -168,28 +242,65 @@ static char read_proc_state(pid_t pid) {
 // ── System Metrics ──────────────────────────────────────────────────────────
 struct SystemMetrics {
     long rss_kb        = 0;
-    int  total_pids    = 0;
+    int  total_pids    = 0;   // every PID on the machine
+    int  tree_pids     = 0;   // PIDs descended from this harness only (F6)
     float mem_used_pct = 0.0f;
     float psi_some     = 0.0f;
 };
 
+// F6: count only the process tree rooted at `root`, by walking PPID links.
+// System-wide total_pids on a shared desktop is dominated by unrelated
+// processes, and its startup baseline is a single noisy sample — which is why
+// the same run can report +67 or -66 depending only on when the baseline was
+// taken. The tree count is the signal the PID-growth guard actually wants.
+static int count_tree_pids(pid_t root,
+                           const std::vector<std::pair<pid_t, pid_t>>& edges) {
+    std::vector<pid_t> stack{root};
+    int count = 0;
+    while (!stack.empty()) {
+        pid_t p = stack.back();
+        stack.pop_back();
+        for (const auto& e : edges) {
+            if (e.second == p) { ++count; stack.push_back(e.first); }
+        }
+    }
+    return count;
+}
+
 static SystemMetrics read_system_metrics() {
     SystemMetrics m;
-    // Count PIDs in /proc
+    std::vector<std::pair<pid_t, pid_t>> edges; // (pid, ppid)
+    // Scan /proc once; derive both the system total and our own tree from it.
     DIR* d = opendir("/proc");
     if (d) {
         struct dirent* e;
         while ((e = readdir(d)) != nullptr) {
-            if (e->d_type == DT_DIR) {
-                bool is_pid = true;
-                for (const char* p = e->d_name; *p; ++p) {
-                    if (!std::isdigit(*p)) { is_pid = false; break; }
+            if (e->d_type != DT_DIR) continue;
+            bool is_pid = true;
+            for (const char* p = e->d_name; *p; ++p) {
+                if (!std::isdigit(*p)) { is_pid = false; break; }
+            }
+            if (!is_pid) continue;
+            pid_t pid = std::stoi(e->d_name);
+            if (pid <= 1) continue;
+            m.total_pids++;
+            // /proc/<pid>/stat: "<pid> (<comm>) <state> <ppid> ..."
+            std::ifstream sf("/proc/" + std::string(e->d_name) + "/stat");
+            std::string line;
+            if (std::getline(sf, line)) {
+                auto rp = line.rfind(')');
+                if (rp != std::string::npos && rp + 2 < line.size()) {
+                    const char* q = line.c_str() + rp + 2; // " S <ppid> ..."
+                    while (*q == ' ') ++q;
+                    if (*q) ++q;                            // skip state char
+                    while (*q == ' ') ++q;
+                    edges.emplace_back(pid, (pid_t)std::strtol(q, nullptr, 10));
                 }
-                if (is_pid && std::stoi(e->d_name) > 1) m.total_pids++;
             }
         }
         closedir(d);
     }
+    m.tree_pids = count_tree_pids(getpid(), edges); // descendants only
     // Read meminfo
     thm::MemInfo mem = thm::read_meminfo();
     m.mem_used_pct = mem.used_pct();
@@ -296,7 +407,7 @@ public:
                  << "census_own_edges,census_prot_pids,census_warn_cwds,"
                  << "census_pend_notify,census_pool,census_lat_win,census_pipe_win,"
                  << "lat_bytes_kb,rss_per_spawn_kb,"
-                 << "mall_inuse_kb,mall_arena_kb,mall_hblkhd_kb\n";
+                 << "mall_inuse_kb,mall_arena_kb,mall_hblkhd_kb,tree_pids\n";
             ofs_.flush();
         }
     }
@@ -346,6 +457,7 @@ public:
              << "," << c.mall_inuse_kb
              << "," << c.mall_arena_kb
              << "," << c.mall_hblkhd_kb
+             << "," << sys.tree_pids
              << "\n";
         ofs_.flush();
     }
@@ -384,6 +496,75 @@ static void print_progress(int elapsed_sec, int total_sec, int tick_count,
               << "   " << std::flush;
 }
 
+// ── Enforcement probe (F1) ──────────────────────────────────────────────────
+// The stress harness otherwise computes decisions and never applies them, so
+// kernel-level enforcement has no empirical coverage. This probe exercises the
+// path end to end on a throwaway process: FREEZE it through the real
+// EnforcementPlane, confirm the kernel stopped it and set the frozen slice,
+// then thaw and reap it.
+//
+// Returns 1 if the freeze was observed in the kernel, -1 if it was not, and 0
+// if the probe could not run at all (no slice — decision-only environment).
+static std::string read_first_line(const std::string& path) {
+    std::ifstream f(path);
+    std::string s;
+    std::getline(f, s);
+    return s;
+}
+
+static int run_enforcement_probe(thm::CgroupController& cgroup,
+                                 thm::EnforcementPlane& enforcement,
+                                 bool slice_ok) {
+    std::cout << "\n[EnforceProbe] Starting enforcement verification...\n";
+    if (!slice_ok) {
+        std::cout << "[EnforceProbe] SKIPPED — archtitan.slice unavailable "
+                     "(decision-only run; cannot reach the kernel).\n";
+        return 0;
+    }
+
+    pid_t child = spawn_idle_process();
+    if (child <= 0) {
+        std::cerr << "[EnforceProbe] FAIL — could not fork sacrificial child\n";
+        return -1;
+    }
+    usleep(50 * 1000);
+    char state_before = read_proc_state(child);
+
+    thm::Workload wl{};
+    wl.id           = 0xFFFFFFFFu;
+    wl.root_pid     = child;
+    wl.pids         = { child };
+    wl.is_protected = false;
+
+    bool applied = enforcement.apply(wl, thm::PolicyDecision::FREEZE);
+    usleep(150 * 1000);
+
+    const std::string frozen_path =
+        std::string(thm::SLICE_ROOT) + "/" + thm::SLICE_FROZEN + "/cgroup.freeze";
+    std::string frozen_val = read_first_line(frozen_path);
+    char state_after = read_proc_state(child);
+
+    // Thaw and release: KEEP_FULL moves to active, SIGCONTs, thaws the slice.
+    enforcement.apply(wl, thm::PolicyDecision::KEEP_FULL);
+    usleep(50 * 1000);
+    reap_pid(child);
+
+    const bool kernel_frozen = (frozen_val == "1");
+    const bool stopped       = (state_after == 'T' || state_after == 't');
+    const bool ok            = applied && kernel_frozen && stopped;
+
+    std::cout << "[EnforceProbe] child=" << child
+              << " state_before=" << state_before
+              << " state_after=" << state_after
+              << " cgroup.freeze=" << (frozen_val.empty() ? "<none>" : frozen_val)
+              << " apply()=" << (applied ? "true" : "false") << "\n";
+    std::cout << "[EnforceProbe] " << (ok ? "VERIFIED" : "NOT VERIFIED")
+              << " — kernel " << (kernel_frozen ? "froze" : "did not freeze")
+              << " the workload, process " << (stopped ? "stopped" : "not stopped")
+              << "\n";
+    return ok ? 1 : -1;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Main Stress Test
 // ═════════════════════════════════════════════════════════════════════════════
@@ -415,6 +596,9 @@ int main(int argc, char* argv[]) {
             cfg.memory_hog_mb = std::max(1, std::stoi(argv[++i]));
             g_memory_hog_mb = cfg.memory_hog_mb;
         }
+        else if (arg == "--memory-floor-mb" && i + 1 < argc) {
+            cfg.memory_floor_mb = std::max(0, std::stoi(argv[++i]));
+        }
         else if (arg == "--aging-phase") cfg.aging_phase = true;
         else if (arg == "--assert") {
             cfg.assert_enabled = true;
@@ -425,6 +609,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--pid-budget" && i + 1 < argc) {
             cfg.pid_growth_budget = std::max(1, std::stoi(argv[++i]));
         }
+        else if (arg == "--require-slice") cfg.require_slice = true;
+        else if (arg == "--enforce-probe") cfg.enforce_probe = true;
         else if (arg == "--rss-budget-pct" && i + 1 < argc) {
             cfg.rss_growth_budget_pct = std::clamp(std::stoi(argv[++i]), 1, 500);
         }
@@ -442,12 +628,21 @@ int main(int argc, char* argv[]) {
                       << "  --aging-phase         Pre-age idle workloads to exercise IDLE->AGING->RECLAIMABLE\n"
                       << "  --memory-hog-mb MB    Per-worker memory allocation (default: 4; raise to push system\n"
                       << "                        toward real HIGH/CRITICAL pressure)\n"
+                      << "  --memory-floor-mb MB  ISSUE-07: ramp real memory down until MemAvailable reaches\n"
+                      << "                        this floor and hold it, so PSI actually registers.\n"
+                      << "                        0 = disabled (default). Hard bound — never goes lower.\n"
                       << "  --assert [P95_MS]     Enable pass/fail assertions (default p95 ceiling 1500ms)\n"
                       << "  --pid-budget N        PID growth assertion budget (default: 300; scale with duration)\n"
                       << "  --rss-budget-pct N    RSS growth assertion budget %% (default: 10)\n"
                       << "  --rss-budget-kb N     Absolute RSS growth assertion budget in KB\n"
                       << "                        (default: 0 = disabled; run passes only if BOTH\n"
                       << "                         %% and KB budgets are satisfied) \n"
+                      << "  --require-slice       Abort (exit 2) if archtitan.slice is unavailable.\n"
+                      << "                        Without the slice every cgroup write is a no-op,\n"
+                      << "                        so the run is decision-only and covers no enforcement.\n"
+                      << "  --enforce-probe       Prove enforcement reaches the kernel: freeze and thaw\n"
+                      << "                        a sacrificial child and verify cgroup.freeze + state T.\n"
+                      << "                        Requires the slice; otherwise SKIPped.\n"
                       << "  --help                Show this help\n";
             return 0;
         }
@@ -470,9 +665,18 @@ int main(int argc, char* argv[]) {
         std::cout << " force_pressure=" << thm::to_string(cfg.force_pressure);
     if (cfg.aging_phase)
         std::cout << " aging_phase=ON";
+    if (cfg.memory_floor_mb > 0)
+        std::cout << " memory_floor=" << cfg.memory_floor_mb << "MB";
     if (cfg.assert_enabled)
         std::cout << " assertions=ON";
     std::cout << "\n\n";
+
+    // ISSUE-07: start the genuine-pressure sink before the pipeline comes up so
+    // it has time to ramp to the floor rather than sampling a cold system.
+    pid_t pressure_sink = spawn_pressure_sink(cfg.memory_floor_mb);
+    if (pressure_sink > 0)
+        std::cout << "[ISSUE-07] Pressure sink " << pressure_sink
+                  << " ramping to MemAvailable <= " << cfg.memory_floor_mb << " MB\n\n";
 
     // ── Init THM components ──────────────────────────────────────────────
     thm::ProtectedRegistry registry;
@@ -480,9 +684,33 @@ int main(int argc, char* argv[]) {
     registry.bootstrap_from_systemd();
 
     thm::CgroupController cgroup;
-    cgroup.setup_slices();
+    bool slice_ok = cgroup.setup_slices();
+    if (!slice_ok) {
+        std::cout << "\n"
+                  << "╔══════════════════════════════════════════════════════════════════╗\n"
+                  << "║  WARNING — DECISION-ONLY RUN                                      ║\n"
+                  << "║  archtitan.slice is unavailable, so no cgroup move, freeze,       ║\n"
+                  << "║  throttle or memory.high can be applied. Every decision is        ║\n"
+                  << "║  computed and logged but NEVER enforced; this run says nothing    ║\n"
+                  << "║  about kernel-level enforcement.                                  ║\n"
+                  << "╚══════════════════════════════════════════════════════════════════╝\n\n";
+        if (cfg.require_slice) {
+            std::cerr << "[STRESS] --require-slice set and archtitan.slice is "
+                         "unavailable — aborting.\n";
+            return 2;
+        }
+    }
+    std::cout << "[STRESS] Enforcement slice: "
+              << (slice_ok ? "ACTIVE (cgroup enforcement will be applied)"
+                           : "ABSENT (decision-only)")
+              << "\n";
 
     thm::EnforcementPlane enforcement(cgroup, registry);
+
+    // F1: prove enforcement actually reaches the kernel (optional).
+    int enforce_probe_status = 0;
+    if (cfg.enforce_probe)
+        enforce_probe_status = run_enforcement_probe(cgroup, enforcement, slice_ok);
     thm::ExecutionDetector detector;
     // Zero grace periods for the stress harness — the 9-step safety logic is
     // exercised at full speed. (Real daemon uses 2s+3s grace; note that an
@@ -527,10 +755,12 @@ int main(int argc, char* argv[]) {
 
     // Baseline system state for leak/pid-growth assertions
     SystemMetrics baseline_sys = read_system_metrics();
-    long baseline_rss_kb   = baseline_sys.rss_kb;
+    long baseline_rss_kb     = baseline_sys.rss_kb;
     int  baseline_total_pids = baseline_sys.total_pids;
+    int  baseline_tree_pids  = baseline_sys.tree_pids;
     std::cout << "[STRESS] Baseline: rss=" << baseline_rss_kb
-              << " KB, total_pids=" << baseline_total_pids << "\n";
+              << " KB, total_pids=" << baseline_total_pids
+              << ", tree_pids=" << baseline_tree_pids << "\n";
 
     // Pipeline-exclusive latency tracking (state machine + policy + enforce only)
     std::vector<double> pipeline_latencies;
@@ -920,6 +1150,12 @@ int main(int argc, char* argv[]) {
     }
     active_workloads.clear();
 
+    if (pressure_sink > 0) {
+        std::cout << "[ISSUE-07] Releasing pressure sink...\n";
+        reap_pid(pressure_sink);
+        pressure_sink = -1;
+    }
+
     std::cout << "[DONE] Stress test complete.\n\n";
 
     // ═════════════════════════════════════════════════════════════════════
@@ -967,15 +1203,19 @@ int main(int argc, char* argv[]) {
                         + std::to_string(rss_growth_pct) + "%)" + why);
         }
 
-        // 2. PID-growth guard: no unbounded accumulation of system PIDs.
-        // Negative growth (fewer PIDs at the end than baseline) is a pass —
-        // the guard exists to catch positive, unbounded accumulation.
-        int pid_growth = final_sys2.total_pids - baseline_total_pids;
+        // 2. PID-growth guard: no unbounded accumulation in OUR process tree.
+        // F6: the tree count excludes unrelated desktop processes, so it is a
+        // clean signal. The system-wide figure is reported for context only —
+        // its single-sample startup baseline makes it noisy and untrendable.
+        int pid_growth     = final_sys2.tree_pids - baseline_tree_pids;
+        int sys_pid_growth = final_sys2.total_pids - baseline_total_pids;
         if (pid_growth <= cfg.pid_growth_budget) {
-            pass_assert("System PID growth " + std::to_string(pid_growth)
-                        + " within budget " + std::to_string(cfg.pid_growth_budget));
+            pass_assert("Process-tree PID growth " + std::to_string(pid_growth)
+                        + " within budget " + std::to_string(cfg.pid_growth_budget)
+                        + " (system-wide " + std::to_string(sys_pid_growth)
+                        + ", informational)");
         } else {
-            fail_assert("System PID growth " + std::to_string(pid_growth)
+            fail_assert("Process-tree PID growth " + std::to_string(pid_growth)
                         + " exceeds budget " + std::to_string(cfg.pid_growth_budget));
         }
 
@@ -1011,6 +1251,17 @@ int main(int argc, char* argv[]) {
                         + " decisions)");
         } else {
             fail_assert("No decisions were produced");
+        }
+
+        // 6. Enforcement probe (F1) — only when requested and it actually ran.
+        // A skip (no slice) is reported by the probe itself and not counted.
+        if (enforce_probe_status != 0) {
+            if (enforce_probe_status == 1) {
+                pass_assert("Enforcement probe: FREEZE reached the kernel "
+                            "(cgroup.freeze=1, child state T)");
+            } else {
+                fail_assert("Enforcement probe: freeze did not reach the kernel");
+            }
         }
 
         if (!all_asserts_passed) {
